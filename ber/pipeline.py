@@ -64,6 +64,7 @@ class Config:
     feat_chunk = 1_000_000
     use_gpu = True
     expand_siblings = False  # second retrieval pass through anchored pool records (low yield; off by default)
+    fast_test = True         # smaller shortlists / fewer key channels on the test split (time-boxed runs)
     block_cfg: Optional[B.BlockConfig] = None
 
 
@@ -333,6 +334,9 @@ class Trainer:
             log(f"[block] {split}/{c}: S1 {len(s1):,} pool {len(pool):,}")
             bc = cfg.block_cfg or B.BlockConfig()
             bc.use_gpu = cfg.use_gpu; bc.n_threads = cfg.n_jobs
+            if split == "test" and cfg.fast_test:
+                bc.k_name, bc.k_combo, bc.k_addr, bc.k_rev_unknown = 6, 6, 3, 8
+                bc.key_types = ("k_hn_street", "k_hn_loc", "k_tok_hn", "k_compact")
             C, _ = B.block_country(s1, pool, bc, log=lambda m: log(f"   {m}"))
             if gt is not None:
                 y, P = _labels(gt, s1.eid.to_numpy(), pool.eid.to_numpy(), C.i1.to_numpy(), C.i2.to_numpy())
@@ -376,7 +380,8 @@ class Trainer:
             s1, pool, roles = self._prepare_country(split, c)
             C = pd.read_parquet(self.work / split / f"cand_raw_{c}.parquet")
             pp = prune_scores(s1, pool, C, pruner)
-            keep = prune_mask(C.i1.to_numpy(), pp, tau=cfg.prune_tau, keep_top=cfg.prune_keep_top, cap=cfg.prune_cap)
+            tau = cfg.prune_tau * (1.5 if (split == "test" and cfg.fast_test) else 1.0)
+            keep = prune_mask(C.i1.to_numpy(), pp, tau=tau, keep_top=cfg.prune_keep_top, cap=cfg.prune_cap)
             C["pp"] = pp
             Ck = C[keep].reset_index(drop=True)
             msg = f"[prune] {split}/{c}: {len(C):,} -> {len(Ck):,} ({len(Ck) / max(1, len(s1)):.2f}/S1)"

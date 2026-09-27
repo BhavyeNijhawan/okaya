@@ -197,10 +197,10 @@ KEY_CAPS = {  # (max S1 records, max pool records) sharing one key; larger group
 
 
 def exact_key_pairs(s1: pd.DataFrame, pool: pd.DataFrame, max_s1: int = 40, max_pool: int = 150,
-                    log=print) -> Tuple[np.ndarray, np.ndarray]:
+                    log=print, key_types=KEY_TYPES) -> Tuple[np.ndarray, np.ndarray]:
     """Join S1 and pool records on every key type (built one at a time); over-populated keys are skipped."""
     pairs: List[np.ndarray] = []
-    for name in KEY_TYPES:
+    for name in key_types:
         cap_s1, cap_pool = KEY_CAPS.get(name, (max_s1, max_pool))
         a = _explode(key_column(s1, name)).rename(columns={"i": "i1"})
         b = _explode(key_column(pool, name)).rename(columns={"i": "i2"})
@@ -239,6 +239,7 @@ class BlockConfig:
     use_gpu = True       # dense random-projection top-K on CUDA when available (see gpu_topk.py)
     gpu_dim = 1024
     gpu_k_extra = 8      # approximate scores: retrieve k + extra per row (measured: recall >= exact top-k)
+    key_types = KEY_TYPES  # exact-key channels to run
     max_df_name = 0.01   # grams in more than this share of documents are dropped (speed; low IDF anyway)
     max_df_addr = 0.01
     ngram = 3
@@ -317,7 +318,7 @@ def block_country(s1: pd.DataFrame, pool: pd.DataFrame, cfg: BlockConfig = Block
         run_reverse(idx2_small, np.arange(n1), cfg.k_rev_unknown, CH_GLOBAL)
     log(f"    global passes done ({time.time() - t0:.0f}s)")
     # 3) exact keys (built one key type at a time to bound memory)
-    i1k, i2k = exact_key_pairs(s1, pool, log=log)
+    i1k, i2k = exact_key_pairs(s1, pool, log=log, key_types=cfg.key_types)
     _accumulate(acc, i1k, i2k, CH_KEY); del i1k, i2k
     log(f"    exact keys done ({time.time() - t0:.0f}s)")
 
