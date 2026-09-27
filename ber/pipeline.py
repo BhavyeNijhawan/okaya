@@ -37,7 +37,7 @@ from .expand import sibling_expansion
 from .features import RateTables, stage1_features, stage2_features
 from .geo import RegionTable, add_region_columns, load_tables, save_tables
 from .models import GBDT
-from .prune import prune_features, prune_mask
+from .prune import prune_features, prune_mask, prune_scores
 from .translit import TranslitDict, retranslit_frame
 
 
@@ -354,9 +354,9 @@ class Trainer:
             for k, c in enumerate(countries):
                 s1, pool, roles = self._prepare_country(split, c)
                 C = pd.read_parquet(self.work / split / f"cand_raw_{c}.parquet")
-                X = prune_features(s1, pool, C)                      # competition features over the full universe
                 m = roles[C.i1.to_numpy()] == "tab"
-                Xs.append(X[m].reset_index(drop=True)); ys.append(C.y.to_numpy()[m]); gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
+                X = prune_features(s1, pool, C, rows=np.flatnonzero(m))   # competition features over the full universe
+                Xs.append(X); ys.append(C.y.to_numpy()[m]); gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
                 del s1, pool, C, X; gc.collect()
             X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
             log(f"[prune] fitting pruner on {len(X):,} tab-slice candidates ({int(y.sum()):,} positives)")
@@ -371,8 +371,7 @@ class Trainer:
             t0 = time.time()
             s1, pool, roles = self._prepare_country(split, c)
             C = pd.read_parquet(self.work / split / f"cand_raw_{c}.parquet")
-            X = prune_features(s1, pool, C)
-            pp = pruner.predict(X); del X
+            pp = prune_scores(s1, pool, C, pruner)
             keep = prune_mask(C.i1.to_numpy(), pp, tau=cfg.prune_tau, keep_top=cfg.prune_keep_top, cap=cfg.prune_cap)
             C["pp"] = pp
             Ck = C[keep].reset_index(drop=True)
@@ -384,8 +383,7 @@ class Trainer:
                 E = sibling_expansion(s1, pool, Ck, n_threads=cfg.n_jobs, log=log, use_gpu=cfg.use_gpu)
                 if len(E):
                     E = E.drop(columns=["sib_cos"])
-                    Xe = prune_features(s1, pool, E)
-                    E["pp"] = pruner.predict(Xe); del Xe
+                    E["pp"] = prune_scores(s1, pool, E, pruner)
                     if "y" in Ck:
                         gt_ = read_ground_truth(self.data_dir / "train" / "train_ground_truth.tsv")
                         ye, _ = _labels(gt_, s1.eid.to_numpy(), pool.eid.to_numpy(), E.i1.to_numpy(), E.i2.to_numpy())

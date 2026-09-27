@@ -197,23 +197,31 @@ def _explode(keys: List[str]) -> pd.DataFrame:
     return pd.DataFrame({"k": vals, "i": np.asarray(idx, dtype=np.int64)})
 
 
+KEY_CAPS = {  # (max S1 records, max pool records) sharing one key; larger groups are common names / numbers
+    "k_hn_street": (30, 60), "k_hn_loc": (30, 60), "k_tok_hn": (30, 60),
+    "k_sorted": (4, 30), "k_compact": (4, 30), "k_skel": (3, 20), "k_letters": (3, 20),
+}
+
+
 def exact_key_pairs(k1: Dict[str, List[str]], k2: Dict[str, List[str]], max_s1: int = 40, max_pool: int = 150,
                     log=print) -> Tuple[np.ndarray, np.ndarray]:
     """Join S1 and pool records on every key; skip over-populated keys (common names / numbers)."""
     pairs: List[np.ndarray] = []
     for name in k1:
+        cap_s1, cap_pool = KEY_CAPS.get(name, (max_s1, max_pool))
         a = _explode(k1[name]).rename(columns={"i": "i1"})
         b = _explode(k2[name]).rename(columns={"i": "i2"})
         if a.empty or b.empty:
             log(f"      key {name}: 0 pairs")
             continue
         ca = a.groupby("k").size(); cb = b.groupby("k").size()
-        ok = set(ca[ca <= max_s1].index) & set(cb[cb <= max_pool].index)
+        ok = set(ca[ca <= cap_s1].index) & set(cb[cb <= cap_pool].index)
         a = a[a.k.isin(ok)]; b = b[b.k.isin(ok)]
         m = a.merge(b, on="k")
         if len(m):
             pairs.append(np.unique(np.stack([m.i1.to_numpy(), m.i2.to_numpy()], axis=1), axis=0))
         log(f"      key {name}: {len(m):,} pairs")
+        del a, b, m
     if not pairs:
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
     P = np.unique(np.concatenate(pairs), axis=0)
