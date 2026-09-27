@@ -101,14 +101,22 @@ def normalize_to_parquet(df: pd.DataFrame, out_path: Path, n_jobs: int = 1, chun
             paths.append(_norm_chunk_to_parquet(job))
             if (j + 1) % 10 == 0:
                 log(f"    normalized {min((j + 1) * chunk, n):,}/{n:,} ({time.time() - t0:.0f}s)")
-    tables = [pq.read_table(pth) for pth in paths]
-    tbl = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-    if extra_cols:
-        for k, v in extra_cols.items():
-            tbl = tbl.append_column(k, pa.array(v))
-    pq.write_table(tbl, out_path, compression="zstd", row_group_size=200_000)
+    # stream the parts into the final file one at a time (never all in memory)
+    writer = None
+    off = 0
     for pth in paths:
+        tbl = pq.read_table(pth)
+        if extra_cols:
+            for k, v in extra_cols.items():
+                tbl = tbl.append_column(k, pa.array(v[off:off + tbl.num_rows]))
+        off += tbl.num_rows
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, tbl.schema, compression="zstd")
+        writer.write_table(tbl, row_group_size=200_000)
+        del tbl
         os.remove(pth)
+    if writer is not None:
+        writer.close()
     try:
         os.rmdir(tmp_dir)
     except OSError:
@@ -130,14 +138,23 @@ def build_norm_tables(data_dir: Path, work: Path, split: str, n_jobs: int = 1, l
         log(f"[norm] {split} S1: {len(s1):,} rows read ({time.time() - t0:.0f}s)")
         normalize_to_parquet(s1, p1, n_jobs=n_jobs, log=log, extra_cols={"src": np.full(len(s1), 1, dtype=np.int8)})
         del s1
-    s2 = read_tsv(data_dir / split / f"{split}_source2.tsv")
-    s3 = read_tsv(data_dir / split / f"{split}_source3.tsv")
-    n_s2 = len(s2)
-    pool = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3
-    log(f"[norm] {split} pool: {len(pool):,} rows read ({time.time() - t0:.0f}s)")
-    src = np.where(np.arange(len(pool)) < n_s2, 2, 3).astype(np.int8)
-    normalize_to_parquet(pool, pp, n_jobs=n_jobs, log=log, extra_cols={"src": src})
+    tmp = [out_dir / f"{split}_pool_s2.parquet", out_dir / f"{split}_pool_s3.parquet"]
+    for src_no, tmp_path in ((2, tmp[0]), (3, tmp[1])):
+        df = read_tsv(data_dir / split / f"{split}_source{src_no}.tsv")
+        log(f"[norm] {split} S{src_no}: {len(df):,} rows read ({time.time() - t0:.0f}s)")
+        normalize_to_parquet(df, tmp_path, n_jobs=n_jobs, log=log, extra_cols={"src": np.full(len(df), src_no, dtype=np.int8)})
+        del df
+    writer = None
+    for tmp_path in tmp:
+        pf = pq.ParquetFile(tmp_path)
+        for rg in range(pf.num_row_groups):
+            tbl = pf.read_row_group(rg)
+            if writer is None:
+                writer = pq.ParquetWriter(pp, tbl.schema, compression="zstd")
+            writer.write_table(tbl)
+        os.remove(tmp_path)
+    if writer is not None:
+        writer.close()
     log(f"[norm] {split}: done ({time.time() - t0:.0f}s)")
     return p1, pp
 

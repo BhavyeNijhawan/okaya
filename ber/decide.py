@@ -2,39 +2,32 @@
 
 Given calibrated match probabilities for candidate pairs, choose for every S1 entity the subset of
 candidates that maximises its *expected* F0.5, including the option of predicting nothing (worth
-P(no true match)). Pool exclusivity (a pool record belongs to at most one S1) is enforced first by
-giving each pool record to its highest-probability claimant.
+P(no true match)).
 
-Expected F0.5 of a prefix (top-k by probability) is estimated by Monte Carlo over the candidates'
-Bernoulli outcomes plus a Poisson number of true matches that blocking never retrieved
-(`lam_miss`, measured on validation). This reproduces the exact break-even conditions of the metric
-(e.g. a candidate must exceed ~0.73 when one other match is certain, ~0.77 with three, 0.5 when it
-is the entity's only possible match) instead of a single global threshold.
+Two probability roles are kept apart:
+  * truth probability  p       - every retrieved candidate contributes to the distribution of the
+                                 entity's true-match count N (even if it cannot be predicted);
+  * eligibility        p_eff   - only candidates the entity is allowed to predict (pool exclusivity:
+                                 a pool record is offered to its best claimant first; if that claimant
+                                 rejects it, it is offered to the next claimant, and so on).
+
+Expected F0.5 of a prefix (top-k eligible by probability) is estimated by Monte Carlo over the
+candidates' Bernoulli outcomes plus a Poisson number of true matches that blocking never retrieved
+(`lam_miss`). This reproduces the exact break-even conditions of the metric (a candidate must exceed
+~0.73 when one other match is certain, ~0.77 with three, 0.5 when it is the entity's only possible
+match) instead of a single global threshold.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import numpy as np
-import pandas as pd
 
 
-def exclusivity_mask(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, min_p: float = 0.0) -> np.ndarray:
-    """True where the pair's S1 is the best claimant of the pool record (ties -> smallest i1)."""
-    order = np.lexsort((i1, -p, i2))
-    i2_sorted = i2[order]
-    first = np.ones(len(i2), dtype=bool)
-    first[1:] = i2_sorted[1:] != i2_sorted[:-1]
-    mask = np.zeros(len(i2), dtype=bool)
-    mask[order[first]] = True
-    if min_p > 0:
-        mask &= p >= min_p
-    return mask
-
-
-def _group_matrix(i1: np.ndarray, p: np.ndarray, max_k: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Per S1 group: probabilities sorted desc, padded with 0 to max_k; returns (ids, P[n_groups, max_k], pair index matrix)."""
-    order = np.lexsort((-p, i1))
+def _group_matrix(i1: np.ndarray, p: np.ndarray, p_eff: np.ndarray, max_k: int):
+    """Per S1 group: candidates ordered by (eligible first, p_eff desc, p desc), padded to max_k.
+    Returns (P_truth[g,K], P_elig[g,K], IDX[g,K] pair indices or -1, n_groups)."""
+    order = np.lexsort((-p, -p_eff, i1))
     g = i1[order]
     start = np.ones(len(g), dtype=bool); start[1:] = g[1:] != g[:-1]
     grp_start = np.flatnonzero(start)
@@ -42,61 +35,86 @@ def _group_matrix(i1: np.ndarray, p: np.ndarray, max_k: int) -> Tuple[np.ndarray
     pos = np.arange(len(g)) - grp_start[grp_id]
     n_groups = len(grp_start)
     P = np.zeros((n_groups, max_k), dtype=np.float32)
+    E = np.zeros((n_groups, max_k), dtype=np.float32)
     IDX = np.full((n_groups, max_k), -1, dtype=np.int64)
     keep = pos < max_k
     P[grp_id[keep], pos[keep]] = p[order][keep]
+    E[grp_id[keep], pos[keep]] = p_eff[order][keep]
     IDX[grp_id[keep], pos[keep]] = order[keep]
-    return g[grp_start], P, IDX
+    # truth mass of candidates beyond max_k still counts towards N (as an expected count)
+    tail = np.zeros(n_groups, dtype=np.float32)
+    if (~keep).any():
+        np.add.at(tail, grp_id[~keep], p[order][~keep])
+    return P, E, IDX, tail
 
 
-def expected_f05_select(i1: np.ndarray, p: np.ndarray, lam_miss: float = 0.02, n_samples: int = 256,
-                        max_k: int = 16, seed: int = 0, chunk: int = 50_000, p_empty_scale: float = 1.0
-                        ) -> np.ndarray:
-    """Boolean mask over pairs: the expected-F0.5-optimal prefix per S1 (possibly empty)."""
-    ids, P, IDX = _group_matrix(i1, p, max_k)
+def expected_f05_select(i1: np.ndarray, p: np.ndarray, p_eff: np.ndarray, lam_miss: float = 0.02,
+                        n_samples: int = 128, max_k: int = 16, seed: int = 0, chunk: int = 8_000) -> np.ndarray:
+    """Boolean mask over pairs: the expected-F0.5-optimal eligible prefix per S1 (possibly empty)."""
+    P, E, IDX, tail = _group_matrix(i1, p, p_eff, max_k)
     n = P.shape[0]
     mask = np.zeros(len(p), dtype=bool)
     rng = np.random.default_rng(seed)
     ks = np.arange(1, max_k + 1, dtype=np.float32)
     for s in range(0, n, chunk):
-        Pc = P[s:s + chunk]                                   # (g, K)
-        g = Pc.shape[0]
+        Pc = P[s:s + chunk]; Ec = E[s:s + chunk]; g = Pc.shape[0]
         U = rng.random((n_samples, g, max_k), dtype=np.float32)
-        Y = (U < Pc[None, :, :]).astype(np.float32)          # sampled truth of candidates
-        M = rng.poisson(lam_miss, size=(n_samples, g)).astype(np.float32)  # unretrieved true matches
-        T = np.cumsum(Y, axis=2)                              # (S, g, K): true positives in top-k
-        N = T[:, :, -1] + M                                   # total true matches
+        Y = (U < Pc[None, :, :]).astype(np.float32)                    # sampled truth of all candidates
+        M = rng.poisson(lam_miss + tail[s:s + chunk][None, :], size=(n_samples, g)).astype(np.float32)
+        N = Y.sum(axis=2) + M                                         # total true matches
+        elig = (Ec > 0)[None, :, :]
+        T = np.cumsum(Y * elig, axis=2)                               # true positives among the first k eligible
         F = 1.25 * T / (ks[None, None, :] + 0.25 * N[:, :, None])
-        EF = F.mean(axis=0)                                   # (g, K)
-        # k=0: utility 1 iff N == 0
-        E0 = (N == 0).mean(axis=0) * p_empty_scale
-        # candidates beyond the group's size have p=0 -> never chosen (EF non-increasing there)
-        valid = Pc > 0
+        EF = F.mean(axis=0)
+        E0 = (N == 0).mean(axis=0)
+        n_elig = (Ec > 0).sum(axis=1)
+        valid = np.arange(max_k)[None, :] < n_elig[:, None]
         EF = np.where(valid, EF, -1.0)
         best_k = EF.argmax(axis=1) + 1
         best_v = EF.max(axis=1)
-        choose = best_v > E0
+        choose = (best_v > E0) & (n_elig > 0)
         for gi in np.flatnonzero(choose):
-            k = best_k[gi]
-            idx = IDX[s + gi, :k]
+            idx = IDX[s + gi, :best_k[gi]]
             mask[idx[idx >= 0]] = True
     return mask
 
 
-def threshold_select(p: np.ndarray, thr: np.ndarray | float) -> np.ndarray:
-    return p >= thr
+def _best_claimant_mask(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, available: np.ndarray) -> np.ndarray:
+    """Among available pairs, True where the pair's S1 has the highest p for that pool record."""
+    p_av = np.where(available, p, -1.0)
+    order = np.lexsort((i1, -p_av, i2))
+    i2_sorted = i2[order]
+    first = np.ones(len(i2), dtype=bool); first[1:] = i2_sorted[1:] != i2_sorted[:-1]
+    m = np.zeros(len(i2), dtype=bool)
+    m[order[first]] = True
+    return m & available
 
 
-def decide(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, method: str = "ef", thr: float = 0.7,
-           lam_miss: float = 0.02, min_p: float = 0.05, n_samples: int = 256, seed: int = 0,
-           p_empty_scale: float = 1.0) -> np.ndarray:
+def decide(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, method: str = "ef", thr: float = 0.7, lam_miss: float = 0.02,
+           min_p: float = 0.05, n_samples: int = 128, seed: int = 0, rounds: int = 3) -> np.ndarray:
     """Final boolean mask over candidate pairs."""
-    excl = exclusivity_mask(i1, i2, p, min_p=min_p)
-    p_eff = np.where(excl, p, 0.0).astype(np.float32)
+    p = p.astype(np.float32)
     if method == "thr":
-        return excl & (p_eff >= thr)
-    sel = expected_f05_select(i1, p_eff, lam_miss=lam_miss, n_samples=n_samples, seed=seed, p_empty_scale=p_empty_scale)
-    return sel & excl
+        best = _best_claimant_mask(i1, i2, p, p >= thr)
+        return best & (p >= thr)
+    available = p >= min_p               # pairs still on offer
+    taken = np.zeros(len(p), dtype=bool)  # pool record already assigned
+    final = np.zeros(len(p), dtype=bool)
+    pool_taken = np.zeros(i2.max() + 1 if len(i2) else 0, dtype=bool)
+    for r in range(rounds):
+        offered = _best_claimant_mask(i1, i2, p, available & ~pool_taken[i2])
+        # entities already finalised keep their picks; others decide with the currently offered records
+        p_eff = np.where(offered, p, 0.0).astype(np.float32)
+        sel = expected_f05_select(i1, p, p_eff, lam_miss=lam_miss, n_samples=n_samples, seed=seed + r)
+        newly = sel & offered & ~pool_taken[i2]
+        final |= newly
+        pool_taken[i2[newly]] = True
+        # records offered but rejected are withdrawn from that claimant and re-offered to the next one
+        rejected = offered & ~sel
+        available &= ~rejected
+        if not rejected.any():
+            break
+    return final
 
 
 def write_lists(s1_eids: np.ndarray, pool_eids: np.ndarray, i1: np.ndarray, i2: np.ndarray, path, header: str) -> None:

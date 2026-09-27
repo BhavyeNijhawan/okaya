@@ -55,13 +55,14 @@ class Config:
     prune_tau = 0.002
     prune_keep_top = 3
     prune_cap = 40
-    max_train_pairs = 6_000_000
+    max_train_pairs = 4_000_000
+    n_mc_samples = 128
     lgb_threads = 2
     stage1_rounds = 3000
     stage2_rounds = 2000
     feat_chunk = 1_000_000
     use_gpu = True
-    expand_siblings = True   # second retrieval pass through anchored pool records (after pruning)
+    expand_siblings = False  # second retrieval pass through anchored pool records (low yield; off by default)
     block_cfg: Optional[B.BlockConfig] = None
 
 
@@ -326,13 +327,13 @@ class Trainer:
         if not GBDT.exists(model_path):
             assert split == "train", "the pruner must be trained first (run the train split)"
             Xs, ys, gs = [], [], []
-            for c in countries:
+            for k, c in enumerate(countries):
                 s1, pool, roles = self._prepare_country(split, c)
                 C = pd.read_parquet(self.work / split / f"cand_raw_{c}.parquet")
+                X = prune_features(s1, pool, C)                      # competition features over the full universe
                 m = roles[C.i1.to_numpy()] == "tab"
-                Cm = C[m].reset_index(drop=True)
-                Xs.append(prune_features(s1, pool, Cm)); ys.append(Cm.y.to_numpy()); gs.append(Cm.i1.to_numpy() + 10_000_000 * len(Xs))
-                del s1, pool, C, Cm; gc.collect()
+                Xs.append(X[m].reset_index(drop=True)); ys.append(C.y.to_numpy()[m]); gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
+                del s1, pool, C, X; gc.collect()
             X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
             log(f"[prune] fitting pruner on {len(X):,} tab-slice candidates ({int(y.sum()):,} positives)")
             pruner = _fit_gbdt(X, y, g, cfg, rounds=600, leaves=63, seed_shift=3, min_child=100)
@@ -425,35 +426,50 @@ class Trainer:
         if countries is None:
             countries = _countries(self.work, split, "feat_*.parquet")
         model_path = self.work / "train" / "stage1"
-        Xs, ys, gs, sizes = [], [], [], []
+        rng = np.random.default_rng(cfg.seed)
+        # train-slice rows per country and a global fit sample (capped) chosen before any feature is read
+        masks, ys, gs = {}, {}, {}
+        n_total = 0
         for k, c in enumerate(countries):
             roles = pd.read_parquet(self.work / split / f"s1ids_{c}.parquet").role.to_numpy()
             C = pd.read_parquet(self.work / split / f"cand_{c}.parquet", columns=["i1", "y"])
             m = roles[C.i1.to_numpy()] == "train"
-            Xs.append(read_feature_rows(self.work / split / f"feat_{c}.parquet", m)); ys.append(C.y.to_numpy()[m])
-            gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
-            sizes.append(int(m.sum()))
-            del C; gc.collect()
-        X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
-        del Xs; gc.collect()
+            masks[c] = m; ys[c] = C.y.to_numpy(); gs[c] = C.i1.to_numpy() + 10_000_000 * k
+            n_total += int(m.sum())
+            del C
+        frac = min(1.0, cfg.max_train_pairs / max(1, n_total))
+        fit_masks = {c: masks[c] & (rng.random(len(masks[c])) < frac) for c in countries}
+        Xs = [read_feature_rows(self.work / split / f"feat_{c}.parquet", fit_masks[c]) for c in countries]
+        X = pd.concat(Xs, ignore_index=True); del Xs
+        y = np.concatenate([ys[c][fit_masks[c]] for c in countries]); g = np.concatenate([gs[c][fit_masks[c]] for c in countries])
         self.feature_names = list(X.columns)
         (self.work / "train" / "features1.json").write_text(json.dumps(self.feature_names))
-        fit_idx = np.arange(len(X))
-        if len(X) > cfg.max_train_pairs:
-            rng = np.random.default_rng(cfg.seed)
-            fit_idx = np.sort(rng.choice(len(X), cfg.max_train_pairs, replace=False))
-        log(f"[stage1] {len(X):,} train-slice pairs ({int(y.sum()):,} positives) x {X.shape[1]} features; fitting on {len(fit_idx):,}")
+        log(f"[stage1] {n_total:,} train-slice pairs; fitting on {len(X):,} ({int(y.sum()):,} positives) x {X.shape[1]} features")
         if not GBDT.exists(model_path) or force:
-            bst = _fit_gbdt(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage1_rounds)
+            bst = _fit_gbdt(X, y, g, cfg, cfg.stage1_rounds)
             bst.save(model_path)
             log(f"[stage1] model ({bst.backend}): {bst.best_iteration} trees")
         bst = GBDT.load(model_path)
-        oof_paths = [self.work / split / f"stage1_oof_{c}.npy" for c in countries]
-        if not all(p.exists() for p in oof_paths) or force:
-            oof = _oof_predict(X, y, g, cfg, cfg.stage1_rounds, max_fit=cfg.max_train_pairs // 2)
-            off = 0
-            for c, n, p in zip(countries, sizes, oof_paths):
-                np.save(p, oof[off:off + n]); off += n
+        # OOF for ALL train-slice rows: 2 folds by S1 group; fit on the fit-sample rows of the other fold,
+        # predict (streaming) on every train row of the held-out fold
+        oof_paths = {c: self.work / split / f"stage1_oof_{c}.npy" for c in countries}
+        if not all(p.exists() for p in oof_paths.values()) or force:
+            fold_of_group = {}
+            for c in countries:
+                for gg in np.unique(gs[c][masks[c]]):
+                    fold_of_group[int(gg)] = int(rng.integers(0, 2))
+            g_fold = np.array([fold_of_group[int(x)] for x in g], dtype=np.int8)
+            oof = {c: np.full(len(masks[c]), np.nan, dtype=np.float32) for c in countries}
+            for f in (0, 1):
+                model = _fit_gbdt(X[g_fold != f], y[g_fold != f], g[g_fold != f], cfg, cfg.stage1_rounds, seed_shift=100 + f)
+                for c in countries:
+                    fold_rows = masks[c] & np.array([fold_of_group.get(int(x), -1) == f for x in gs[c]])
+                    if fold_rows.any():
+                        Xf = read_feature_rows(self.work / split / f"feat_{c}.parquet", fold_rows, columns=self.feature_names)
+                        oof[c][fold_rows] = model.predict(Xf); del Xf
+                del model; gc.collect()
+            for c in countries:
+                np.save(oof_paths[c], oof[c][masks[c]])
             log("[stage1] OOF predictions written")
         del X; gc.collect()
         for c in countries:
@@ -470,33 +486,33 @@ class Trainer:
             countries = _countries(self.work, split, "feat_*.parquet")
         feats1 = json.loads((self.work / "train" / "features1.json").read_text())
         model_path = self.work / "train" / "stage2"
+        rng = np.random.default_rng(cfg.seed + 1)
         Xs, ys, gs = [], [], []
+        n_total = sum(int((pd.read_parquet(self.work / split / f"s1ids_{c}.parquet").role.to_numpy()[
+            pd.read_parquet(self.work / split / f"cand_{c}.parquet", columns=["i1"]).i1.to_numpy()] == "train").sum()) for c in countries)
+        frac = min(1.0, cfg.max_train_pairs / max(1, n_total))
         for k, c in enumerate(countries):
             s1, pool, roles = self._prepare_country(split, c)
             C = pd.read_parquet(self.work / split / f"cand_{c}.parquet", columns=["i1", "i2", "y"])
             p1 = np.load(self.work / split / f"p1_{c}.npy")
             m_train = roles[C.i1.to_numpy()] == "train"
-            p1_used = p1.copy()
             oof_path = self.work / split / f"stage1_oof_{c}.npy"
-            if oof_path.exists():
-                p1_used[m_train] = np.load(oof_path)
+            assert oof_path.exists(), "stage-1 OOF predictions are required for stage-2 training"
+            p1_used = p1.copy(); p1_used[m_train] = np.load(oof_path)
             F2 = stage2_features(s1, pool, C, p1_used)
             F2.to_parquet(self.work / split / f"feat2_{c}.parquet", index=False)
-            F1 = read_feature_rows(self.work / split / f"feat_{c}.parquet", m_train, columns=feats1)
-            X = pd.concat([F1, F2[m_train].reset_index(drop=True)], axis=1)
-            Xs.append(X); ys.append(C.y.to_numpy()[m_train]); gs.append(C.i1.to_numpy()[m_train] + 10_000_000 * k)
+            fit_mask = m_train & (rng.random(len(m_train)) < frac)
+            F1 = read_feature_rows(self.work / split / f"feat_{c}.parquet", fit_mask, columns=feats1)
+            X = pd.concat([F1, F2[fit_mask].reset_index(drop=True)], axis=1)
+            Xs.append(X); ys.append(C.y.to_numpy()[fit_mask]); gs.append(C.i1.to_numpy()[fit_mask] + 10_000_000 * k)
             del F1, F2, s1, pool, C; gc.collect()
         X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
         del Xs; gc.collect()
         self.feature_names2 = list(X.columns)
         (self.work / "train" / "features2.json").write_text(json.dumps(self.feature_names2))
-        fit_idx = np.arange(len(X))
-        if len(X) > cfg.max_train_pairs:
-            rng = np.random.default_rng(cfg.seed + 1)
-            fit_idx = np.sort(rng.choice(len(X), cfg.max_train_pairs, replace=False))
-        log(f"[stage2] training on {len(fit_idx):,} pairs x {X.shape[1]} features")
+        log(f"[stage2] training on {len(X):,} pairs x {X.shape[1]} features")
         if not GBDT.exists(model_path) or force:
-            bst = _fit_gbdt(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage2_rounds, seed_shift=5)
+            bst = _fit_gbdt(X, y, g, cfg, cfg.stage2_rounds, seed_shift=5)
             bst.save(model_path)
             log(f"[stage2] model ({bst.backend}): {bst.best_iteration} trees")
         del X; gc.collect()
@@ -509,6 +525,7 @@ class Trainer:
 
     # -- stage: tune (calibration + decision) on the val slice --------------------------------
     def tune(self, countries: Optional[List[str]] = None) -> dict:
+        """Calibration and decision selection on val-A (every other val entity); reporting on val-B."""
         cfg = self.cfg; split = "train"
         if countries is None:
             countries = _countries(self.work, split, "p2_*.npy")
@@ -518,42 +535,44 @@ class Trainer:
             C = pd.read_parquet(self.work / split / f"cand_{c}.parquet", columns=["i1", "i2", "y"])
             p2 = np.load(self.work / split / f"p2_{c}.npy")
             T = pd.read_parquet(self.work / split / f"truth_{c}.parquet")
-            rows.append((c, roles, len(roles), C, p2, T))
-        pv = np.concatenate([r[4][r[1][r[3].i1.to_numpy()] == "val"] for r in rows])
-        yv = np.concatenate([r[3].y.to_numpy()[r[1][r[3].i1.to_numpy()] == "val"] for r in rows])
-        cal = Calibrator().fit(pv, yv)
-        report: Dict[str, object] = {"calibration_points": int(len(pv)), "variants": {}}
+            val = roles == "val"
+            val_a = val & (np.arange(len(roles)) % 2 == 0); val_b = val & ~val_a
+            rows.append((c, roles, len(roles), C, p2, T, val_a, val_b))
+        pa_ = np.concatenate([r[4][r[6][r[3].i1.to_numpy()]] for r in rows])
+        ya = np.concatenate([r[3].y.to_numpy()[r[6][r[3].i1.to_numpy()]] for r in rows])
+        cal = Calibrator().fit(pa_, ya)
+        report: Dict[str, object] = {"calibration_points": int(len(pa_)), "variants": {}}
         best = None
 
-        def evaluate(method: str, **kw) -> Tuple[float, Dict[str, float]]:
-            scores = []
-            for (c, roles, n_s1, C, p2, T) in rows:
+        def evaluate(method: str, **kw):
+            res = {"a": [], "b": []}
+            for (c, roles, n_s1, C, p2, T, va, vb) in rows:
                 pc_ = cal(p2)
-                mask = decide(C.i1.to_numpy(), C.i2.to_numpy(), pc_, method=method, seed=cfg.seed, **kw)
-                val_s1 = np.flatnonzero(roles == "val")
+                mask = decide(C.i1.to_numpy(), C.i2.to_numpy(), pc_, method=method, seed=cfg.seed, n_samples=cfg.n_mc_samples, **kw)
                 f = per_entity_scores(n_s1, C.i1.to_numpy()[mask], C.i2.to_numpy()[mask], T.i1.to_numpy(), T.i2.to_numpy())
-                scores.append((c, float(f[val_s1].mean()), len(val_s1)))
-            total = sum(s * n for _, s, n in scores) / sum(n for _, _, n in scores)
-            return total, {c: s for c, s, _ in scores}
+                res["a"].append((c, float(f[va].mean()), int(va.sum()))); res["b"].append((c, float(f[vb].mean()), int(vb.sum())))
+            tot = {k: sum(s_ * n for _, s_, n in v) / sum(n for _, _, n in v) for k, v in res.items()}
+            return tot, {c: s_ for c, s_, _ in res["b"]}
 
         for lam in (0.0, 0.01, 0.02, 0.04):
-            total, by_c = evaluate("ef", lam_miss=lam, n_samples=128)
-            report["variants"][f"ef_lam_{lam}"] = {"macro_f05": total, "by_country": by_c}
-            log(f"[tune] EF lam={lam}: {total:.5f} " + " ".join(f"{c}={s:.5f}" for c, s in by_c.items()))
-            if best is None or total > best[1]:
-                best = (("ef", lam), total)
+            tot, by_c = evaluate("ef", lam_miss=lam)
+            report["variants"][f"ef_lam_{lam}"] = {"select_half": tot["a"], "report_half": tot["b"], "report_by_country": by_c}
+            log(f"[tune] EF lam={lam}: select {tot['a']:.5f} | report {tot['b']:.5f} " + " ".join(f"{c}={s_:.5f}" for c, s_ in by_c.items()))
+            if best is None or tot["a"] > best[1]:
+                best = (("ef", lam), tot["a"], tot["b"])
         for thr in (0.6, 0.65, 0.7, 0.75, 0.8):
-            total, by_c = evaluate("thr", thr=thr)
-            report["variants"][f"thr_{thr}"] = {"macro_f05": total, "by_country": by_c}
-            log(f"[tune] THR {thr}: {total:.5f} " + " ".join(f"{c}={s:.5f}" for c, s in by_c.items()))
-            if total > best[1]:
-                best = (("thr", thr), total)
+            tot, by_c = evaluate("thr", thr=thr)
+            report["variants"][f"thr_{thr}"] = {"select_half": tot["a"], "report_half": tot["b"], "report_by_country": by_c}
+            log(f"[tune] THR {thr}: select {tot['a']:.5f} | report {tot['b']:.5f} " + " ".join(f"{c}={s_:.5f}" for c, s_ in by_c.items()))
+            if tot["a"] > best[1]:
+                best = (("thr", thr), tot["a"], tot["b"])
         method, param = best[0]
         decision = {"method": method, "lam_miss": param if method == "ef" else 0.02, "thr": param if method == "thr" else 0.7,
-                    "val_macro_f05": best[1], "calibrator": cal.to_json()}
+                    "n_samples": cfg.n_mc_samples, "val_select_macro_f05": best[1], "val_report_macro_f05": best[2],
+                    "calibrator": cal.to_json()}
         (self.work / "train" / "decision.json").write_text(json.dumps(decision))
         (self.work / "train" / "tune_report.json").write_text(json.dumps(report, indent=1))
-        log(f"[tune] best: {method} {param} -> {best[1]:.5f}")
+        log(f"[tune] best: {method} {param} -> held-out report {best[2]:.5f} (selection half {best[1]:.5f})")
         return report
 
     def train_all(self) -> None:
@@ -585,7 +604,7 @@ class Predictor(Trainer):
         diag: Dict[str, dict] = {}
         all_s1 = pq.read_table(self.work / "norm" / "test_s1.parquet", columns=["eid"]).to_pandas().eid.to_numpy()
         pos_all = {e: i for i, e in enumerate(all_s1.tolist())}
-        cand_lists: Dict[int, List[str]] = {}; match_lists: Dict[int, List[str]] = {}
+        cand_g1, cand_eid, match_flag = [], [], []
         for c in countries:
             t0 = time.time()
             s1, pool, _ = self._prepare_country(split, c)
@@ -596,14 +615,13 @@ class Predictor(Trainer):
             p2 = predict_chunked(bst2, fpath, feats2, extra=F2)
             del F2; gc.collect()
             pc_ = cal(p2)
-            mask = decide(C.i1.to_numpy(), C.i2.to_numpy(), pc_, method=dec["method"], thr=dec["thr"], lam_miss=dec["lam_miss"], seed=self.cfg.seed)
+            mask = decide(C.i1.to_numpy(), C.i2.to_numpy(), pc_, method=dec["method"], thr=dec["thr"], lam_miss=dec["lam_miss"],
+                          seed=self.cfg.seed, n_samples=int(dec.get("n_samples", self.cfg.n_mc_samples)))
             pd.DataFrame({"i1": C.i1, "i2": C.i2, "p1": p1, "p2": p2, "pc": pc_, "match": mask}).to_parquet(self.work / split / f"scored_{c}.parquet", index=False)
             s1_eids = s1.eid.to_numpy(); pool_eids = pool.eid.to_numpy()
             i1 = C.i1.to_numpy(); i2 = C.i2.to_numpy()
-            for a, b in zip(i1.tolist(), i2.tolist()):
-                cand_lists.setdefault(pos_all[s1_eids[a]], []).append(pool_eids[b])
-            for a, b in zip(i1[mask].tolist(), i2[mask].tolist()):
-                match_lists.setdefault(pos_all[s1_eids[a]], []).append(pool_eids[b])
+            g1 = np.fromiter((pos_all[e] for e in s1_eids.tolist()), dtype=np.int64, count=len(s1_eids))[i1]
+            cand_g1.append(g1); cand_eid.append(pool_eids[i2]); match_flag.append(mask)
             n_pred = np.bincount(i1[mask], minlength=len(s1))
             src = pool.src.to_numpy()[i2]
             diag[c] = {"s1": int(len(s1)), "pool": int(len(pool)), "candidates": int(len(C)), "cand_per_s1": float(len(C) / len(s1)),
@@ -614,12 +632,23 @@ class Predictor(Trainer):
                        "seconds": round(time.time() - t0, 1)}
             log(f"[predict] {c}: {diag[c]}")
             del s1, pool, C; gc.collect()
+        g1 = np.concatenate(cand_g1); eids = np.concatenate(cand_eid); mf = np.concatenate(match_flag)
+        del cand_g1, cand_eid, match_flag
+        order = np.argsort(g1, kind="stable"); g1 = g1[order]; eids = eids[order]; mf = mf[order]
+        bounds = np.flatnonzero(np.diff(g1)) + 1 if len(g1) else np.zeros(0, np.int64)
+        starts = np.concatenate([[0], bounds]) if len(g1) else np.zeros(0, np.int64)
+        ends = np.concatenate([bounds, [len(g1)]]) if len(g1) else np.zeros(0, np.int64)
+        first_of = {int(g1[a]): (int(a), int(b)) for a, b in zip(starts, ends)}
         with open(out_dir / "candidate_pairs.tsv", "w", encoding="utf-8", newline="\n") as fc, \
              open(out_dir / "matching_results.tsv", "w", encoding="utf-8", newline="\n") as fm:
             fc.write("source1_entity_id\tcandidate_entity_ids\n"); fm.write("source1_entity_id\tmatched_entity_ids\n")
             for k, e in enumerate(all_s1.tolist()):
-                fc.write(f"{e}\t{','.join(cand_lists.get(k, []))}\n")
-                fm.write(f"{e}\t{','.join(match_lists.get(k, []))}\n")
+                ab = first_of.get(k)
+                if ab is None:
+                    fc.write(f"{e}\t\n"); fm.write(f"{e}\t\n"); continue
+                a, b = ab
+                fc.write(f"{e}\t{','.join(eids[a:b].tolist())}\n")
+                fm.write(f"{e}\t{','.join(eids[a:b][mf[a:b]].tolist())}\n")
         (out_dir / "diagnostics.json").write_text(json.dumps(diag, indent=1))
         log(f"[predict] wrote {out_dir / 'matching_results.tsv'} and candidate_pairs.tsv")
         return diag

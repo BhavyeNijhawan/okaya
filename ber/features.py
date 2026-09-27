@@ -480,7 +480,7 @@ def stage1_features(S: pd.DataFrame, Q: pd.DataFrame, C: pd.DataFrame, tables: R
 # stage-2 features: score context + sibling evidence
 # ---------------------------------------------------------------------------------------------
 def stage2_features(S: pd.DataFrame, Q: pd.DataFrame, C: pd.DataFrame, p1: np.ndarray, anchor_thr: float = 0.9,
-                    max_anchors: int = 4) -> pd.DataFrame:
+                    max_anchors: int = 3, sib_p1_cap: float = 0.95) -> pd.DataFrame:
     i1 = C["i1"].to_numpy(); i2 = C["i2"].to_numpy(); n = len(C)
     F: Dict[str, np.ndarray] = {"p1": p1.astype(np.float32)}
     logit = np.log(np.clip(p1, 1e-6, 1 - 1e-6) / np.clip(1 - p1, 1e-6, 1))
@@ -520,14 +520,15 @@ def stage2_features(S: pd.DataFrame, Q: pd.DataFrame, C: pd.DataFrame, p1: np.nd
         key = (int(i1[k]), int(src[k]))
         if len(anchors[key]) < max_anchors:
             anchors[key].append(int(i2[k]))
+    # sibling comparisons only where they can change a decision (p1 below `sib_p1_cap`); confident pairs keep 0
     pair_idx: List[int] = []; anc_idx: List[int] = []
-    for k in range(n):
+    for k in np.flatnonzero(p1 < sib_p1_cap):
         lst = anchors.get((int(i1[k]), int(src[k])))
         if not lst:
             continue
         for a in lst:
             if a != i2[k]:
-                pair_idx.append(k); anc_idx.append(a)
+                pair_idx.append(int(k)); anc_idx.append(a)
     sib_raw = np.zeros(n, np.float32); sib_name = np.zeros(n, np.float32); sib_hn = np.zeros(n, np.float32)
     sib_street = np.zeros(n, np.float32); sib_loc = np.zeros(n, np.float32); sib_legal = np.zeros(n, np.float32)
     sib_script = np.zeros(n, np.float32); sib_n = np.zeros(n, np.float32)

@@ -153,17 +153,19 @@ def key_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
         h = hn[i]
         r = reg[i] or "_"
         if h and (len(h) >= 2 or " " in hn_runs[i]):
+            # number alternatives: the primary run and, for compound numbers, the full compound (4-8-139)
+            hs = [h] if len(h) >= 2 else []
             if " " in hn_runs[i]:
-                h = hn_runs[i].replace(" ", "-")  # compound numbers: 4-8-139 -> "4-8-139"
+                hs.append(hn_runs[i].replace(" ", "-"))
             st = street[i].split()[:4]
             if st:
-                k_hn_street[i] = ";".join(f"{r}|{h}|{t}" for t in st if len(t) >= 3)
+                k_hn_street[i] = ";".join(f"{r}|{hh}|{t}" for hh in hs for t in st if len(t) >= 3)
             lc = loc[i].split()[:4]
             if lc:
-                k_hn_loc[i] = ";".join(f"{r}|{h}|{t}" for t in lc if len(t) >= 3)
+                k_hn_loc[i] = ";".join(f"{r}|{hh}|{t}" for hh in hs for t in lc if len(t) >= 3)
             ct = core2[i].split()[:4]
             if ct:
-                k_tok_hn[i] = ";".join(f"{r}|{t}|{h}" for t in ct if len(t) >= 3)
+                k_tok_hn[i] = ";".join(f"{r}|{t}|{hh}" for hh in hs for t in ct if len(t) >= 3)
         if len(sorted2[i]) >= 6:
             k_sorted[i] = sorted2[i]
         c = compact[i]

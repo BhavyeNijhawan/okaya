@@ -13,10 +13,10 @@ import numpy as np
 import scipy.sparse as sp
 
 _ALPHA = "abcdefghijklmnopqrstuvwxyz0123456789 "
-_LUT = np.zeros(256, dtype=np.int32)
+_SPACE = 36
+_LUT = np.full(256, _SPACE, dtype=np.int32)  # unknown bytes -> space
 for _i, _c in enumerate(_ALPHA):
     _LUT[ord(_c)] = _i
-_SPACE = 36
 
 
 def _encode(docs: List[str], max_len: int):

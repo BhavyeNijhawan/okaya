@@ -360,13 +360,22 @@ def parse_address(raw: str) -> Dict[str, object]:
     comps = [_clean_component(c) for c in text.split(",")]
     comps = [c for c in comps if c]
     has_hn_kw = 1 if _HN_KEYWORD_RE.search(text) or "#" in text else 0
-    # choose the house-number component: first component containing a digit that is not an ordinal-only
+    # choose the house-number component: first component containing a digit that is not an ordinal-only,
+    # preferring components that do not start with a unit designator ("Suite 7", "Unit 105", "Fl 2")
     hn_idx = -1
+    fallback = -1
     for i, c in enumerate(comps):
         toks = c.split()
         if any(any(ch.isdigit() for ch in t) and not _ORDINAL_RE.match(t) for t in toks):
+            first = toks[0].rstrip(".")
+            if STREET_TYPES.get(first, first) in UNIT_WORDS or first in ("po", "p.o", "box"):
+                if fallback < 0:
+                    fallback = i
+                continue
             hn_idx = i
             break
+    if hn_idx < 0:
+        hn_idx = fallback
     hn, hn_runs, street_tokens, stype, unit = "", [], [], "", ""
     all_alpha: List[str] = []
     loc_tokens: List[str] = []
