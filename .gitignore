@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+work/
+output/
+*.parquet
+*.npy
+.ipynb_checkpoints/
