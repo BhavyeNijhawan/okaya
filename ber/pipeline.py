@@ -46,6 +46,7 @@ def log(msg: str) -> None:
 
 
 class Config:
+    universe_frac = 0.30       # share of training S1 (and of orphan pool records) used as the training universe
     hide_frac = 0.188          # hidden S1 share -> test-like pool density (5.75 records / S1)
     tab_frac = 0.12            # slice for rate tables + pruner
     train_frac = 0.40          # matcher training slice
@@ -219,15 +220,32 @@ class Trainer:
         rng = np.random.default_rng(cfg.seed)
         roles: Dict[str, str] = {}
         for c in sorted(s1_meta.country.unique()):
-            eids = s1_meta.eid[s1_meta.country == c].to_numpy()
+            eids_all = s1_meta.eid[s1_meta.country == c].to_numpy()
+            perm_all = rng.permutation(len(eids_all))
+            n_uni = int(cfg.universe_frac * len(eids_all))
+            for e in eids_all[perm_all[n_uni:]].tolist():
+                roles[e] = "skip"                       # outside the training universe (records dropped)
+            eids = eids_all[perm_all[:n_uni]]
             perm = rng.permutation(len(eids)); n = len(eids)
             n_hide = int(cfg.hide_frac * n); n_tab = int(cfg.tab_frac * n); n_tr = int(cfg.train_frac * n); n_val = int(cfg.val_frac * n)
             cuts = np.cumsum([n_hide, n_tab, n_tr, n_val])
             for name, a, b in zip(("hidden", "tab", "train", "val"), np.concatenate([[0], cuts[:-1]]), cuts):
                 for e in eids[perm[a:b]].tolist():
                     roles[e] = name
-            log(f"[universe] {c}: S1 {n:,} hidden {n_hide:,} tab {n_tab:,} train {n_tr:,} val {n_val:,} context {n - cuts[-1]:,}")
+            log(f"[universe] {c}: S1 {len(eids_all):,} -> universe {n:,}: hidden {n_hide:,} tab {n_tab:,} train {n_tr:,} val {n_val:,} context {n - cuts[-1]:,}")
         uni_path.write_text(json.dumps(roles))
+        # pool records kept in the training universe: copies of universe S1 (visible or hidden) + a matching share of orphans
+        pool_eids_all = pq.read_table(self.work / "norm" / "train_pool.parquet", columns=["eid"]).to_pandas().eid.to_numpy()
+        owner_role = {}
+        for e, lst in gt.items():
+            r = roles.get(e, "context")
+            for x in lst:
+                owner_role[x] = r
+        keep = np.fromiter((owner_role.get(x, "orphan") != "skip" and (owner_role.get(x, "orphan") != "orphan" or rng.random() < cfg.universe_frac)
+                            for x in pool_eids_all.tolist()), dtype=bool, count=len(pool_eids_all))
+        pd.DataFrame({"eid": pool_eids_all[keep]}).to_parquet(self.work / "train" / "pool_keep.parquet", index=False)
+        log(f"[universe] pool records kept: {int(keep.sum()):,}/{len(pool_eids_all):,}")
+        del owner_role, pool_eids_all, keep
         # region tables: unsupervised on every record of the country (train + test), supervised on train/tab pairs
         pool_meta = pq.read_table(self.work / "norm" / "train_pool.parquet", columns=["eid", "country", "a_comps"]).to_pandas()
         have_test = (self.work / "norm" / "test_s1.parquet").exists()
@@ -280,8 +298,14 @@ class Trainer:
         if split == "train":
             roles_map = json.loads((self.work / "train" / "universe.json").read_text())
             role = np.array([roles_map.get(e, "context") for e in s1.eid.tolist()], dtype=object)
-            keep = role != "hidden"
+            keep = (role != "hidden") & (role != "skip")
             s1 = s1[keep].reset_index(drop=True); roles = role[keep]
+            keep_path = self.work / "train" / "pool_keep.parquet"
+            if keep_path.exists():
+                kept = set(pd.read_parquet(keep_path).eid.tolist())
+                pm = np.fromiter((e in kept for e in pool.eid.tolist()), dtype=bool, count=len(pool))
+                pool = pool[pm].reset_index(drop=True)
+                del kept
         tabs = load_tables(self.work / "tables" / "regions.json")
         t = tabs.get(country, RegionTable(country))
         add_region_columns(s1, t); add_region_columns(pool, t)
@@ -554,13 +578,13 @@ class Trainer:
             tot = {k: sum(s_ * n for _, s_, n in v) / sum(n for _, _, n in v) for k, v in res.items()}
             return tot, {c: s_ for c, s_, _ in res["b"]}
 
-        for lam in (0.0, 0.01, 0.02, 0.04):
+        for lam in (0.0, 0.02, 0.05):
             tot, by_c = evaluate("ef", lam_miss=lam)
             report["variants"][f"ef_lam_{lam}"] = {"select_half": tot["a"], "report_half": tot["b"], "report_by_country": by_c}
             log(f"[tune] EF lam={lam}: select {tot['a']:.5f} | report {tot['b']:.5f} " + " ".join(f"{c}={s_:.5f}" for c, s_ in by_c.items()))
             if best is None or tot["a"] > best[1]:
                 best = (("ef", lam), tot["a"], tot["b"])
-        for thr in (0.6, 0.65, 0.7, 0.75, 0.8):
+        for thr in (0.65, 0.75):
             tot, by_c = evaluate("thr", thr=thr)
             report["variants"][f"thr_{thr}"] = {"select_half": tot["a"], "report_half": tot["b"], "report_by_country": by_c}
             log(f"[tune] THR {thr}: select {tot['a']:.5f} | report {tot['b']:.5f} " + " ".join(f"{c}={s_:.5f}" for c, s_ in by_c.items()))

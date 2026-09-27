@@ -30,6 +30,7 @@ def make_cfg(a: argparse.Namespace) -> Config:
     cfg.lgb_threads = a.jobs
     cfg.use_gpu = not a.no_gpu
     cfg.hide_frac = a.hide_frac
+    cfg.universe_frac = a.universe_frac
     cfg.train_frac = a.train_frac
     cfg.max_train_pairs = a.max_train_pairs
     bc = B.BlockConfig()
@@ -48,6 +49,7 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--hide-frac", type=float, default=0.188)
+    ap.add_argument("--universe-frac", type=float, default=0.30)
     ap.add_argument("--train-frac", type=float, default=0.40)
     ap.add_argument("--max-train-pairs", type=int, default=6_000_000)
     ap.add_argument("--max-df", type=float, default=0.03)

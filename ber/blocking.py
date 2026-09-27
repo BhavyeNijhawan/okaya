@@ -237,7 +237,7 @@ class BlockConfig:
     min_part = 2000    # partitions smaller than this are folded into the global pass
     use_gpu = True       # dense random-projection top-K on CUDA when available (see gpu_topk.py)
     gpu_dim = 1024
-    gpu_k_extra = 4      # approximate scores: retrieve k + extra per row
+    gpu_k_extra = 8      # approximate scores: retrieve k + extra per row (measured: recall >= exact top-k)
     max_df_name = 0.01   # grams in more than this share of documents are dropped (speed; low IDF anyway)
     max_df_addr = 0.01
     ngram = 3

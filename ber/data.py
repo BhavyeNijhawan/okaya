@@ -147,11 +147,17 @@ def build_norm_tables(data_dir: Path, work: Path, split: str, n_jobs: int = 1, l
     writer = None
     for tmp_path in tmp:
         pf = pq.ParquetFile(tmp_path)
-        for rg in range(pf.num_row_groups):
-            tbl = pf.read_row_group(rg)
-            if writer is None:
-                writer = pq.ParquetWriter(pp, tbl.schema, compression="zstd")
-            writer.write_table(tbl)
+        try:
+            for rg in range(pf.num_row_groups):
+                tbl = pf.read_row_group(rg)
+                if writer is None:
+                    writer = pq.ParquetWriter(pp, tbl.schema, compression="zstd")
+                writer.write_table(tbl)
+                del tbl
+        finally:
+            if hasattr(pf, "close"):
+                pf.close()
+            del pf
         os.remove(tmp_path)
     if writer is not None:
         writer.close()
