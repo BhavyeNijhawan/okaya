@@ -131,57 +131,50 @@ def _sorted_letters(s: str) -> str:
     return "".join(sorted(s)) if len(s) >= 8 else ""
 
 
-def key_columns(df: pd.DataFrame) -> Dict[str, List[str]]:
-    """Blocking keys per record: dict name -> list (len n) of '|'-separated key strings ('' = none).
+KEY_TYPES = ("k_hn_street", "k_hn_loc", "k_tok_hn", "k_sorted", "k_compact", "k_skel", "k_letters")
 
-    Multi-valued keys (one per locality / street / core token) are encoded as a single string with
-    ';' between alternatives; `exact_key_pairs` explodes them.
-    """
-    hn = df["a_hn"].to_numpy()
-    hn_runs = df["a_hn_runs"].to_numpy()
-    reg = df["part"].to_numpy()
-    street = df["a_street"].to_numpy()
-    loc = df["a_loc2"].to_numpy()
-    core2 = df["n_core2"].to_numpy()
-    sorted2 = df["n_sorted2"].to_numpy()
-    compact = df["n_compact"].to_numpy()
-    skel = df["n_skel"].to_numpy()
-    dom = df["n_dom"].to_numpy()
+
+def key_column(df: pd.DataFrame, name: str) -> List[str]:
+    """One blocking key type per record ('' = none). Multi-valued keys are ';'-joined alternatives."""
     n = len(df)
-    k_hn_street, k_hn_loc, k_tok_hn, k_sorted, k_compact, k_skel, k_letters, k_dom = ([""] * n for _ in range(8))
-    for i in range(n):
-        h = hn[i]
-        r = reg[i] or "_"
-        if h and (len(h) >= 2 or " " in hn_runs[i]):
-            # number alternatives: the primary run and, for compound numbers, the full compound (4-8-139)
+    out = [""] * n
+    if name in ("k_hn_street", "k_hn_loc", "k_tok_hn"):
+        hn = df["a_hn"].to_numpy(dtype=object); hn_runs = df["a_hn_runs"].to_numpy(dtype=object)
+        reg = df["part"].to_numpy(dtype=object)
+        col = {"k_hn_street": "a_street", "k_hn_loc": "a_loc2", "k_tok_hn": "n_core2"}[name]
+        toks = df[col].to_numpy(dtype=object)
+        for i in range(n):
+            h = hn[i]
+            if not h:
+                continue
+            runs = hn_runs[i]
+            if len(h) < 2 and " " not in runs:
+                continue
             hs = [h] if len(h) >= 2 else []
-            if " " in hn_runs[i]:
-                hs.append(hn_runs[i].replace(" ", "-"))
-            st = street[i].split()[:4]
-            if st:
-                k_hn_street[i] = ";".join(f"{r}|{hh}|{t}" for hh in hs for t in st if len(t) >= 3)
-            lc = loc[i].split()[:4]
-            if lc:
-                k_hn_loc[i] = ";".join(f"{r}|{hh}|{t}" for hh in hs for t in lc if len(t) >= 3)
-            ct = core2[i].split()[:4]
-            if ct:
-                k_tok_hn[i] = ";".join(f"{r}|{t}|{hh}" for hh in hs for t in ct if len(t) >= 3)
-        if len(sorted2[i]) >= 6:
-            k_sorted[i] = sorted2[i]
-        c = compact[i]
-        if len(c) >= 6:
-            k_compact[i] = c
-            if len(c) >= 8:
-                k_letters[i] = "".join(sorted(c))
-        if len(skel[i]) >= 6:
-            k_skel[i] = skel[i]
-        d = dom[i]
-        if len(d) >= 5:
-            k_dom[i] = d
-    # a domain-form name should hit the concatenated core of the other side (and vice versa)
-    k_compact_dom = [d if d else c for d, c in zip(k_dom, k_compact)]
-    return {"k_hn_street": k_hn_street, "k_hn_loc": k_hn_loc, "k_tok_hn": k_tok_hn, "k_sorted": k_sorted,
-            "k_compact": k_compact_dom, "k_skel": k_skel, "k_letters": k_letters}
+            if " " in runs and (len(h) < 2 or runs.count(" ") >= 2):
+                hs.append(runs.replace(" ", "-"))   # compound numbers (4-8-139) when the primary is weak
+            r = reg[i] or "_"
+            tt = [t for t in toks[i].split()[:4] if len(t) >= 3]
+            if not tt:
+                continue
+            if name == "k_tok_hn":
+                out[i] = ";".join(f"{r}|{t}|{hh}" for hh in hs for t in tt)
+            else:
+                out[i] = ";".join(f"{r}|{hh}|{t}" for hh in hs for t in tt)
+        return out
+    if name == "k_sorted":
+        v = df["n_sorted2"].to_numpy(dtype=object)
+        return [x if len(x) >= 6 else "" for x in v]
+    if name == "k_compact":
+        comp = df["n_compact"].to_numpy(dtype=object); dom = df["n_dom"].to_numpy(dtype=object)
+        return [d if len(d) >= 5 else (c if len(c) >= 6 else "") for d, c in zip(dom, comp)]
+    if name == "k_skel":
+        v = df["n_skel"].to_numpy(dtype=object)
+        return [x if len(x) >= 6 else "" for x in v]
+    if name == "k_letters":
+        comp = df["n_compact"].to_numpy(dtype=object)
+        return [_sorted_letters(c) for c in comp]
+    raise KeyError(name)
 
 
 def _explode(keys: List[str]) -> pd.DataFrame:
@@ -203,29 +196,29 @@ KEY_CAPS = {  # (max S1 records, max pool records) sharing one key; larger group
 }
 
 
-def exact_key_pairs(k1: Dict[str, List[str]], k2: Dict[str, List[str]], max_s1: int = 40, max_pool: int = 150,
+def exact_key_pairs(s1: pd.DataFrame, pool: pd.DataFrame, max_s1: int = 40, max_pool: int = 150,
                     log=print) -> Tuple[np.ndarray, np.ndarray]:
-    """Join S1 and pool records on every key; skip over-populated keys (common names / numbers)."""
+    """Join S1 and pool records on every key type (built one at a time); over-populated keys are skipped."""
     pairs: List[np.ndarray] = []
-    for name in k1:
+    for name in KEY_TYPES:
         cap_s1, cap_pool = KEY_CAPS.get(name, (max_s1, max_pool))
-        a = _explode(k1[name]).rename(columns={"i": "i1"})
-        b = _explode(k2[name]).rename(columns={"i": "i2"})
+        a = _explode(key_column(s1, name)).rename(columns={"i": "i1"})
+        b = _explode(key_column(pool, name)).rename(columns={"i": "i2"})
         if a.empty or b.empty:
-            log(f"      key {name}: 0 pairs")
+            log(f"      key {name}: 0 pairs"); del a, b
             continue
         ca = a.groupby("k").size(); cb = b.groupby("k").size()
-        ok = set(ca[ca <= cap_s1].index) & set(cb[cb <= cap_pool].index)
+        ok = ca.index[ca <= cap_s1].intersection(cb.index[cb <= cap_pool])
         a = a[a.k.isin(ok)]; b = b[b.k.isin(ok)]
         m = a.merge(b, on="k")
         if len(m):
-            pairs.append(np.unique(np.stack([m.i1.to_numpy(), m.i2.to_numpy()], axis=1), axis=0))
+            pairs.append(np.unique(np.stack([m.i1.to_numpy().astype(np.int32), m.i2.to_numpy().astype(np.int32)], axis=1), axis=0))
         log(f"      key {name}: {len(m):,} pairs")
-        del a, b, m
+        del a, b, m, ca, cb, ok
     if not pairs:
         return np.zeros(0, np.int64), np.zeros(0, np.int64)
     P = np.unique(np.concatenate(pairs), axis=0)
-    return P[:, 0], P[:, 1]
+    return P[:, 0].astype(np.int64), P[:, 1].astype(np.int64)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -252,7 +245,7 @@ class BlockConfig:
 
 
 def _accumulate(acc: Dict[str, list], i1, i2, ch):
-    acc["i1"].append(np.asarray(i1, np.int64)); acc["i2"].append(np.asarray(i2, np.int64))
+    acc["i1"].append(np.asarray(i1, np.int32)); acc["i2"].append(np.asarray(i2, np.int32))
     acc["ch"].append(np.full(len(i1), ch, np.int16))
 
 
@@ -291,6 +284,7 @@ def block_country(s1: pd.DataFrame, pool: pd.DataFrame, cfg: BlockConfig = Block
     log(f"    partitions: {len(big)} large; S1 global {len(idx1_small):,}/{n1:,}; pool global {len(idx2_small):,}/{n2:,}")
 
     def run_forward(i1_idx: np.ndarray, i2_idx: np.ndarray, tag: int):
+        nonlocal acc
         for key, k, thr in (("name", cfg.k_name, cfg.thr_name), ("combo", cfg.k_combo, cfg.thr_combo), ("addr", cfg.k_addr, cfg.thr_addr)):
             A = X[key][0][i1_idx]; B = X[key][1][i2_idx]
             r, c, v = topk(key, A, B, k, thr)
@@ -322,26 +316,29 @@ def block_country(s1: pd.DataFrame, pool: pd.DataFrame, cfg: BlockConfig = Block
     if len(idx2_small):
         run_reverse(idx2_small, np.arange(n1), cfg.k_rev_unknown, CH_GLOBAL)
     log(f"    global passes done ({time.time() - t0:.0f}s)")
-    # 3) exact keys
-    k1 = key_columns(s1); k2 = key_columns(pool)
-    i1k, i2k = exact_key_pairs(k1, k2, log=log)
-    _accumulate(acc, i1k, i2k, CH_KEY)
+    # 3) exact keys (built one key type at a time to bound memory)
+    i1k, i2k = exact_key_pairs(s1, pool, log=log)
+    _accumulate(acc, i1k, i2k, CH_KEY); del i1k, i2k
     log(f"    exact keys done ({time.time() - t0:.0f}s)")
 
     i1 = np.concatenate(acc["i1"]); i2 = np.concatenate(acc["i2"]); ch = np.concatenate(acc["ch"])
+    acc.clear()
     # unique (i1, i2) with OR-ed channel bits (vectorised)
-    key = i1 * np.int64(n2) + i2
+    key = i1.astype(np.int64) * np.int64(n2) + i2
+    del i1, i2
     order = np.argsort(key, kind="stable")
-    key, ch = key[order], ch[order]
+    key = key[order]; ch = ch[order]; del order
     first = np.ones(len(key), dtype=bool)
     first[1:] = key[1:] != key[:-1]
     starts = np.flatnonzero(first)
     ch_u = np.bitwise_or.reduceat(ch, starts) if len(starts) else ch[:0]
-    key_u = key[starts]
-    df = pd.DataFrame({"i1": key_u // n2, "i2": key_u % n2, "ch": ch_u.astype(np.int16)})
-    # scores for every pair
+    key_u = key[starts]; del key, ch, first, starts
+    i1u = (key_u // n2).astype(np.int32); i2u = (key_u % n2).astype(np.int32); del key_u
+    df = pd.DataFrame({"i1": i1u, "i2": i2u, "ch": ch_u.astype(np.int16)})
+    # exact scores for every pair, one channel at a time, releasing the matrices
     for key, col in (("name", "s_name"), ("combo", "s_combo"), ("addr", "s_addr")):
-        df[col] = rowwise_cosine(X[key][0], X[key][1], df.i1.to_numpy(), df.i2.to_numpy())
-    df["i1"] = df["i1"].astype(np.int32); df["i2"] = df["i2"].astype(np.int32)
+        df[col] = rowwise_cosine(X[key][0], X[key][1], i1u, i2u, chunk=500_000)
+        X[key] = None
+    del X
     log(f"    candidates: {len(df):,} ({len(df) / max(1, n1):.2f}/S1) ({time.time() - t0:.0f}s)")
     return df, vectorizers

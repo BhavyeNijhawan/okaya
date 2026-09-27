@@ -83,8 +83,8 @@ def _load_country(work: Path, split: str, country: str) -> Tuple[pd.DataFrame, p
     for name in ("s1", "pool"):
         tbl = pq.read_table(work / "norm" / f"{split}_{name}.parquet", filters=flt, columns=NORM_COLS)
         df = tbl.to_pandas(types_mapper=pd.ArrowDtype)
-        for c in SHORT_STR + ("eid", "country", "a_comps", "a_loc"):
-            df[c] = np.array(["" if x is None else x for x in df[c].tolist()], dtype=object)
+        for c in SHORT_STR + ("country",):
+            df[c] = pd.Categorical(["" if x is None else x for x in df[c].tolist()])
         for c in ("n_ntok", "a_has_hn_kw", "a_ncomp", "addr_empty", "src"):
             df[c] = df[c].to_numpy().astype(np.int32)
         out.append(df.reset_index(drop=True))
@@ -309,6 +309,10 @@ class Trainer:
         tabs = load_tables(self.work / "tables" / "regions.json")
         t = tabs.get(country, RegionTable(country))
         add_region_columns(s1, t); add_region_columns(pool, t)
+        for df in (s1, pool):
+            for c in ("region", "part"):
+                df[c] = pd.Categorical(df[c])
+            df["a_loc2"] = pd.array(df["a_loc2"].tolist(), dtype=pd.ArrowDtype(pa.string()))
         td = TranslitDict.load(self.work / "tables" / "translit.json")
         retranslit_frame(pool, td); retranslit_frame(s1, td)
         return s1, pool, roles

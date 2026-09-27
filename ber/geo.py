@@ -186,7 +186,7 @@ class RegionTable:
         for s in comps_joined:
             r = cache.get(s)
             if r is None:
-                comps = s.split("|") if s else []
+                comps = s.split("|") if isinstance(s, str) and s else []
                 c, i = self.code_of_comps(comps)
                 r = (c, self.partition(c), i)
                 if len(cache) < 3_000_000:
@@ -298,5 +298,5 @@ def add_region_columns(df: pd.DataFrame, table: RegionTable) -> pd.DataFrame:
     codes, parts, idx = table.assign(df["a_comps"].tolist())
     df["region"] = codes
     df["part"] = parts
-    df["a_loc2"] = [strip_region_tokens(l, i, c, table) for l, i, c in zip(df["a_loc"].tolist(), idx.tolist(), df["a_comps"].tolist())]
+    df["a_loc2"] = [strip_region_tokens(l or "", i, c or "", table) for l, i, c in zip(df["a_loc"].tolist(), idx.tolist(), df["a_comps"].tolist())]
     return df
