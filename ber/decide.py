@@ -91,7 +91,7 @@ def _best_claimant_mask(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, available
 
 
 def decide(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, method: str = "ef", thr: float = 0.7, lam_miss: float = 0.02,
-           min_p: float = 0.05, n_samples: int = 128, seed: int = 0, rounds: int = 3) -> np.ndarray:
+           min_p: float = 0.05, n_samples: int = 128, seed: int = 0, rounds: int = 1) -> np.ndarray:
     """Final boolean mask over candidate pairs."""
     p = p.astype(np.float32)
     if method == "thr":
@@ -104,8 +104,10 @@ def decide(i1: np.ndarray, i2: np.ndarray, p: np.ndarray, method: str = "ef", th
     for r in range(rounds):
         offered = _best_claimant_mask(i1, i2, p, available & ~pool_taken[i2])
         # entities already finalised keep their picks; others decide with the currently offered records
-        p_eff = np.where(offered, p, 0.0).astype(np.float32)
-        sel = expected_f05_select(i1, p, p_eff, lam_miss=lam_miss, n_samples=n_samples, seed=seed + r)
+        p_eff = np.where(offered | final, p, 0.0).astype(np.float32)
+        # truth mass: records this entity may still predict or has already taken (records lost to a stronger
+        # claimant most likely belong to that claimant and are excluded, as are records below min_p)
+        sel = expected_f05_select(i1, p_eff, p_eff, lam_miss=lam_miss, n_samples=n_samples, seed=seed + r)
         newly = sel & offered & ~pool_taken[i2]
         final |= newly
         pool_taken[i2[newly]] = True
