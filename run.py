@@ -52,7 +52,7 @@ def main() -> None:
     ap.add_argument("--max-train-pairs", type=int, default=6_000_000)
     ap.add_argument("--max-df", type=float, default=0.03)
     ap.add_argument("--ngram", type=int, default=3)
-    ap.add_argument("--prune-tau", type=float, default=0.003)
+    ap.add_argument("--prune-tau", type=float, default=0.002)
     ap.add_argument("--stages", default="norm,tables,block,prune,feat,stage1,stage2,tune")
     ap.add_argument("--countries", default=None, help="comma-separated subset (default: all)")
     a = ap.parse_args()

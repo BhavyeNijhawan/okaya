@@ -24,7 +24,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -34,9 +33,11 @@ from . import blocking as B
 from .data import build_norm_tables, gt_pairs, read_ground_truth
 from .decide import decide
 from .evaluate import per_entity_scores
+from .expand import sibling_expansion
 from .features import RateTables, stage1_features, stage2_features
 from .geo import RegionTable, add_region_columns, load_tables, save_tables
-from .prune import fit_pruner, prune_features, prune_mask
+from .models import GBDT
+from .prune import prune_features, prune_mask
 from .translit import TranslitDict, retranslit_frame
 
 
@@ -51,8 +52,8 @@ class Config:
     val_frac = 0.12            # calibration / decision / reporting slice
     seed = 42
     n_jobs = 2
-    prune_tau = 0.003
-    prune_keep_top = 2
+    prune_tau = 0.002
+    prune_keep_top = 3
     prune_cap = 40
     max_train_pairs = 6_000_000
     lgb_threads = 2
@@ -60,12 +61,13 @@ class Config:
     stage2_rounds = 2000
     feat_chunk = 1_000_000
     use_gpu = True
+    expand_siblings = True   # second retrieval pass through anchored pool records (after pruning)
     block_cfg: Optional[B.BlockConfig] = None
 
 
 NORM_COLS = ["eid", "country", "raw_name", "raw_addr", "n_name", "n_name_alt", "n_core", "n_core2", "n_sorted2", "n_compact",
              "n_skel", "n_legal", "n_dom", "n_first", "n_ntok", "a_alpha", "a_hn", "a_hn_runs", "a_nums", "a_street", "a_stype",
-             "a_loc2", "a_loc", "a_unit", "a_has_hn_kw", "a_ncomp", "a_comps", "addr_empty", "src"]
+             "a_loc", "a_unit", "a_has_hn_kw", "a_ncomp", "a_comps", "addr_empty", "src"]
 SHORT_STR = ("n_legal", "n_first", "n_dom", "a_hn", "a_stype", "a_unit")
 
 
@@ -79,7 +81,7 @@ def _load_country(work: Path, split: str, country: str) -> Tuple[pd.DataFrame, p
     for name in ("s1", "pool"):
         tbl = pq.read_table(work / "norm" / f"{split}_{name}.parquet", filters=flt, columns=NORM_COLS)
         df = tbl.to_pandas(types_mapper=pd.ArrowDtype)
-        for c in SHORT_STR + ("eid", "country", "a_comps", "a_loc2", "a_loc"):
+        for c in SHORT_STR + ("eid", "country", "a_comps", "a_loc"):
             df[c] = np.array(["" if x is None else x for x in df[c].tolist()], dtype=object)
         for c in ("n_ntok", "a_has_hn_kw", "a_ncomp", "addr_empty", "src"):
             df[c] = df[c].to_numpy().astype(np.int32)
@@ -95,21 +97,18 @@ def _labels(gt_map: Dict[str, List[str]], s1_eids: np.ndarray, pool_eids: np.nda
     return y, P
 
 
-def _lgb_params(cfg: Config, leaves: int = 255, lr: float = 0.05, seed: int = 42) -> dict:
-    return dict(objective="binary", learning_rate=lr, num_leaves=leaves, min_data_in_leaf=50, feature_fraction=0.8,
-                bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, num_threads=cfg.lgb_threads, seed=seed)
-
-
-def _fit_lgb(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg: Config, rounds: int, leaves: int = 255, seed_shift: int = 0) -> lgb.Booster:
+def _fit_gbdt(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg: "Config", rounds: int, leaves: int = 255,
+              seed_shift: int = 0, min_child: int = 50) -> GBDT:
+    """Fit a GBDT with early stopping on a 5% hold-out of S1 groups."""
     rng = np.random.default_rng(cfg.seed + seed_shift)
     ug = np.unique(groups)
     hold = np.isin(groups, rng.choice(ug, max(1, len(ug) // 20), replace=False))
-    params = _lgb_params(cfg, leaves, seed=cfg.seed + seed_shift)
-    dtr = lgb.Dataset(X[~hold], y[~hold]); dva = lgb.Dataset(X[hold], y[hold])
-    return lgb.train(params, dtr, num_boost_round=rounds, valid_sets=[dva], callbacks=[lgb.early_stopping(100, verbose=False)])
+    m = GBDT(leaves=leaves, rounds=rounds, seed=cfg.seed + seed_shift, threads=cfg.lgb_threads, min_child=min_child)
+    m.fit(X[~hold], y[~hold], X[hold], y[hold])
+    return m
 
 
-def _oof_predict(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg: Config, rounds: int, n_folds: int = 2,
+def _oof_predict(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg: "Config", rounds: int, n_folds: int = 2,
                  max_fit: int = 4_000_000) -> np.ndarray:
     """Out-of-fold predictions (folds by S1 group) for stage-2 training."""
     rng = np.random.default_rng(cfg.seed + 7)
@@ -122,9 +121,41 @@ def _oof_predict(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, cfg: Config
         fit_idx = np.flatnonzero(~m)
         if len(fit_idx) > max_fit:
             fit_idx = np.sort(rng.choice(fit_idx, max_fit, replace=False))
-        bst = _fit_lgb(X.iloc[fit_idx], y[fit_idx], groups[fit_idx], cfg, rounds, seed_shift=100 + f)
-        oof[m] = bst.predict(X[m]).astype(np.float32)
+        model = _fit_gbdt(X.iloc[fit_idx], y[fit_idx], groups[fit_idx], cfg, rounds, seed_shift=100 + f)
+        oof[m] = model.predict(X[m])
     return oof
+
+
+def read_feature_rows(path: Path, mask: Optional[np.ndarray] = None, columns: Optional[List[str]] = None,
+                      batch_size: int = 500_000) -> pd.DataFrame:
+    """Read a (possibly huge) feature parquet, keeping only rows where mask is True, batch by batch."""
+    pf = pq.ParquetFile(path)
+    parts = []
+    off = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=columns):
+        n = batch.num_rows
+        df = batch.to_pandas()
+        if mask is not None:
+            df = df[mask[off:off + n]]
+        parts.append(df)
+        off += n
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns or [])
+
+
+def predict_chunked(model: GBDT, path: Path, columns: List[str], extra: Optional[pd.DataFrame] = None,
+                    batch_size: int = 500_000) -> np.ndarray:
+    """model.predict over a feature parquet read in batches; `extra` (aligned rows) is concatenated per batch."""
+    pf = pq.ParquetFile(path)
+    out = []
+    off = 0
+    for batch in pf.iter_batches(batch_size=batch_size, columns=[c for c in columns if extra is None or c not in extra.columns]):
+        n = batch.num_rows
+        df = batch.to_pandas()
+        if extra is not None:
+            df = pd.concat([df.reset_index(drop=True), extra.iloc[off:off + n].reset_index(drop=True)], axis=1)
+        out.append(model.predict(df[columns]))
+        off += n
+    return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
 class Calibrator:
@@ -291,8 +322,8 @@ class Trainer:
         cfg = self.cfg
         if countries is None:
             countries = _countries(self.work, split, "cand_raw_*.parquet")
-        model_path = self.work / "train" / "pruner.txt"
-        if not model_path.exists():
+        model_path = self.work / "train" / "pruner"
+        if not GBDT.exists(model_path):
             assert split == "train", "the pruner must be trained first (run the train split)"
             Xs, ys, gs = [], [], []
             for c in countries:
@@ -304,10 +335,10 @@ class Trainer:
                 del s1, pool, C, Cm; gc.collect()
             X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
             log(f"[prune] fitting pruner on {len(X):,} tab-slice candidates ({int(y.sum()):,} positives)")
-            pruner = fit_pruner(X, y, g, seed=cfg.seed, n_threads=cfg.lgb_threads)
-            pruner.save_model(str(model_path))
+            pruner = _fit_gbdt(X, y, g, cfg, rounds=600, leaves=63, seed_shift=3, min_child=100)
+            pruner.save(model_path)
             del X, Xs; gc.collect()
-        pruner = lgb.Booster(model_file=str(model_path))
+        pruner = GBDT.load(model_path)
         for c in countries:
             out = self.work / split / f"cand_{c}.parquet"
             if out.exists() and not force:
@@ -316,7 +347,7 @@ class Trainer:
             s1, pool, roles = self._prepare_country(split, c)
             C = pd.read_parquet(self.work / split / f"cand_raw_{c}.parquet")
             X = prune_features(s1, pool, C)
-            pp = pruner.predict(X).astype(np.float32); del X
+            pp = pruner.predict(X); del X
             keep = prune_mask(C.i1.to_numpy(), pp, tau=cfg.prune_tau, keep_top=cfg.prune_keep_top, cap=cfg.prune_cap)
             C["pp"] = pp
             Ck = C[keep].reset_index(drop=True)
@@ -324,6 +355,19 @@ class Trainer:
             if "y" in C:
                 msg += f"; true kept {int(Ck.y.sum()):,}/{int(C.y.sum()):,} ({Ck.y.sum() / max(1, C.y.sum()):.5f} of retrieved)"
             log(msg + f" ({time.time() - t0:.0f}s)")
+            if cfg.expand_siblings:
+                E = sibling_expansion(s1, pool, Ck, n_threads=cfg.n_jobs, log=log, use_gpu=cfg.use_gpu)
+                if len(E):
+                    E = E.drop(columns=["sib_cos"])
+                    Xe = prune_features(s1, pool, E)
+                    E["pp"] = pruner.predict(Xe); del Xe
+                    if "y" in Ck:
+                        gt_ = read_ground_truth(self.data_dir / "train" / "train_ground_truth.tsv")
+                        ye, _ = _labels(gt_, s1.eid.to_numpy(), pool.eid.to_numpy(), E.i1.to_numpy(), E.i2.to_numpy())
+                        E["y"] = ye
+                        log(f"[expand] {split}/{c}: {len(E):,} sibling candidates, {int(ye.sum()):,} true")
+                    Ck = pd.concat([Ck, E[Ck.columns]], ignore_index=True)
+                    Ck = Ck.sort_values(["i1", "i2"]).reset_index(drop=True)
             Ck.to_parquet(out, index=False)
             del s1, pool, C, Ck; gc.collect()
 
@@ -380,16 +424,16 @@ class Trainer:
         cfg = self.cfg; split = "train"
         if countries is None:
             countries = _countries(self.work, split, "feat_*.parquet")
-        model_path = self.work / "train" / "stage1.txt"
+        model_path = self.work / "train" / "stage1"
         Xs, ys, gs, sizes = [], [], [], []
         for k, c in enumerate(countries):
             roles = pd.read_parquet(self.work / split / f"s1ids_{c}.parquet").role.to_numpy()
             C = pd.read_parquet(self.work / split / f"cand_{c}.parquet", columns=["i1", "y"])
             m = roles[C.i1.to_numpy()] == "train"
-            F = pd.read_parquet(self.work / split / f"feat_{c}.parquet")
-            Xs.append(F[m].reset_index(drop=True)); ys.append(C.y.to_numpy()[m]); gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
+            Xs.append(read_feature_rows(self.work / split / f"feat_{c}.parquet", m)); ys.append(C.y.to_numpy()[m])
+            gs.append(C.i1.to_numpy()[m] + 10_000_000 * k)
             sizes.append(int(m.sum()))
-            del F, C; gc.collect()
+            del C; gc.collect()
         X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
         del Xs; gc.collect()
         self.feature_names = list(X.columns)
@@ -399,11 +443,11 @@ class Trainer:
             rng = np.random.default_rng(cfg.seed)
             fit_idx = np.sort(rng.choice(len(X), cfg.max_train_pairs, replace=False))
         log(f"[stage1] {len(X):,} train-slice pairs ({int(y.sum()):,} positives) x {X.shape[1]} features; fitting on {len(fit_idx):,}")
-        if not model_path.exists() or force:
-            bst = _fit_lgb(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage1_rounds)
-            bst.save_model(str(model_path))
-            log(f"[stage1] model: {bst.num_trees()} trees")
-        bst = lgb.Booster(model_file=str(model_path))
+        if not GBDT.exists(model_path) or force:
+            bst = _fit_gbdt(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage1_rounds)
+            bst.save(model_path)
+            log(f"[stage1] model ({bst.backend}): {bst.best_iteration} trees")
+        bst = GBDT.load(model_path)
         oof_paths = [self.work / split / f"stage1_oof_{c}.npy" for c in countries]
         if not all(p.exists() for p in oof_paths) or force:
             oof = _oof_predict(X, y, g, cfg, cfg.stage1_rounds, max_fit=cfg.max_train_pairs // 2)
@@ -416,8 +460,7 @@ class Trainer:
             out = self.work / split / f"p1_{c}.npy"
             if out.exists() and not force:
                 continue
-            F = pd.read_parquet(self.work / split / f"feat_{c}.parquet", columns=self.feature_names)
-            np.save(out, bst.predict(F).astype(np.float32)); del F; gc.collect()
+            np.save(out, predict_chunked(bst, self.work / split / f"feat_{c}.parquet", self.feature_names)); gc.collect()
         log("[stage1] p1 written")
 
     # -- stage: stage 2 -----------------------------------------------------------------------
@@ -426,7 +469,7 @@ class Trainer:
         if countries is None:
             countries = _countries(self.work, split, "feat_*.parquet")
         feats1 = json.loads((self.work / "train" / "features1.json").read_text())
-        model_path = self.work / "train" / "stage2.txt"
+        model_path = self.work / "train" / "stage2"
         Xs, ys, gs = [], [], []
         for k, c in enumerate(countries):
             s1, pool, roles = self._prepare_country(split, c)
@@ -439,8 +482,8 @@ class Trainer:
                 p1_used[m_train] = np.load(oof_path)
             F2 = stage2_features(s1, pool, C, p1_used)
             F2.to_parquet(self.work / split / f"feat2_{c}.parquet", index=False)
-            F1 = pd.read_parquet(self.work / split / f"feat_{c}.parquet", columns=feats1)
-            X = pd.concat([F1[m_train].reset_index(drop=True), F2[m_train].reset_index(drop=True)], axis=1)
+            F1 = read_feature_rows(self.work / split / f"feat_{c}.parquet", m_train, columns=feats1)
+            X = pd.concat([F1, F2[m_train].reset_index(drop=True)], axis=1)
             Xs.append(X); ys.append(C.y.to_numpy()[m_train]); gs.append(C.i1.to_numpy()[m_train] + 10_000_000 * k)
             del F1, F2, s1, pool, C; gc.collect()
         X = pd.concat(Xs, ignore_index=True); y = np.concatenate(ys); g = np.concatenate(gs)
@@ -452,18 +495,16 @@ class Trainer:
             rng = np.random.default_rng(cfg.seed + 1)
             fit_idx = np.sort(rng.choice(len(X), cfg.max_train_pairs, replace=False))
         log(f"[stage2] training on {len(fit_idx):,} pairs x {X.shape[1]} features")
-        if not model_path.exists() or force:
-            bst = _fit_lgb(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage2_rounds, seed_shift=5)
-            bst.save_model(str(model_path))
-            log(f"[stage2] model: {bst.num_trees()} trees")
+        if not GBDT.exists(model_path) or force:
+            bst = _fit_gbdt(X.iloc[fit_idx], y[fit_idx], g[fit_idx], cfg, cfg.stage2_rounds, seed_shift=5)
+            bst.save(model_path)
+            log(f"[stage2] model ({bst.backend}): {bst.best_iteration} trees")
         del X; gc.collect()
-        bst = lgb.Booster(model_file=str(model_path))
+        bst = GBDT.load(model_path)
         for c in countries:
-            F1 = pd.read_parquet(self.work / split / f"feat_{c}.parquet", columns=feats1)
             F2 = pd.read_parquet(self.work / split / f"feat2_{c}.parquet")
-            X = pd.concat([F1, F2], axis=1)[self.feature_names2]
-            np.save(self.work / split / f"p2_{c}.npy", bst.predict(X).astype(np.float32))
-            del F1, F2, X; gc.collect()
+            np.save(self.work / split / f"p2_{c}.npy", predict_chunked(bst, self.work / split / f"feat_{c}.parquet", self.feature_names2, extra=F2))
+            del F2; gc.collect()
         log("[stage2] p2 written")
 
     # -- stage: tune (calibration + decision) on the val slice --------------------------------
@@ -537,8 +578,8 @@ class Predictor(Trainer):
         self.feat(split, countries, force=force)
         feats1 = json.loads((self.work / "train" / "features1.json").read_text())
         feats2 = json.loads((self.work / "train" / "features2.json").read_text())
-        bst1 = lgb.Booster(model_file=str(self.work / "train" / "stage1.txt"))
-        bst2 = lgb.Booster(model_file=str(self.work / "train" / "stage2.txt"))
+        bst1 = GBDT.load(self.work / "train" / "stage1")
+        bst2 = GBDT.load(self.work / "train" / "stage2")
         dec = json.loads((self.work / "train" / "decision.json").read_text())
         cal = Calibrator.from_json(dec["calibrator"])
         diag: Dict[str, dict] = {}
@@ -549,12 +590,11 @@ class Predictor(Trainer):
             t0 = time.time()
             s1, pool, _ = self._prepare_country(split, c)
             C = pd.read_parquet(self.work / split / f"cand_{c}.parquet")
-            F1 = pd.read_parquet(self.work / split / f"feat_{c}.parquet", columns=feats1)
-            p1 = bst1.predict(F1).astype(np.float32)
+            fpath = self.work / split / f"feat_{c}.parquet"
+            p1 = predict_chunked(bst1, fpath, feats1)
             F2 = stage2_features(s1, pool, C, p1)
-            X = pd.concat([F1, F2], axis=1)[feats2]
-            p2 = bst2.predict(X).astype(np.float32)
-            del F1, F2, X; gc.collect()
+            p2 = predict_chunked(bst2, fpath, feats2, extra=F2)
+            del F2; gc.collect()
             pc_ = cal(p2)
             mask = decide(C.i1.to_numpy(), C.i2.to_numpy(), pc_, method=dec["method"], thr=dec["thr"], lam_miss=dec["lam_miss"], seed=self.cfg.seed)
             pd.DataFrame({"i1": C.i1, "i2": C.i2, "p1": p1, "p2": p2, "pc": pc_, "match": mask}).to_parquet(self.work / split / f"scored_{c}.parquet", index=False)

@@ -58,7 +58,7 @@ class CharGramTfidf:
                 codes = codes * 37 + arr[:, k:L - self.n + 1 + k]
             # valid n-grams: those that overlap the document (start < len+1) and are not all-space
             pos = np.arange(L - self.n + 1)[None, :]
-            valid = pos < (lengths[:, None] + 1)  # includes trailing boundary gram
+            valid = pos < (lengths[:, None] + 3 - self.n)  # grams inside " " + doc + " " (one boundary space each side)
             allspace = codes == (37 ** self.n - 1)  # code of "   "
             valid &= ~allspace
             rows = np.repeat(np.arange(m), L - self.n + 1).reshape(m, -1)[valid]
